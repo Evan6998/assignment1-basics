@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import regex as re
+import collections
 from collections.abc import Iterable
 from typing import IO, Any, BinaryIO
 
@@ -300,7 +302,7 @@ def run_transformer_lm(
         num_heads (int): Number of heads to use in multi-headed attention. `d_model` must be
             evenly divisible by `num_heads`.
         d_ff (int): Dimensionality of the feed-forward inner layer (section 3.3).
-        rope_theta (float): The RoPE $\Theta$ parameter.
+        rope_theta (float): The RoPE $Theta$ parameter.
         weights (dict[str, Tensor]):
             State dict of our reference implementation. {num_layers} refers to an
             integer between `0` and `num_layers - 1` (the layer index).
@@ -563,10 +565,10 @@ def get_tokenizer(
 
 
 def run_train_bpe(
-    input_path: str | os.PathLike,
+    input_path: str | os.PathLike[str],
     vocab_size: int,
     special_tokens: list[str],
-    **kwargs,
+    **kwargs, # type: ignore
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
     """Given the path to an input corpus, run train a BPE tokenizer and
     output its vocabulary and merges.
@@ -589,4 +591,104 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    raise NotImplementedError
+
+    vocab: dict[int, bytes] = {index: bytes([index]) for index in range(256)}
+    for special_token in special_tokens:
+        vocab[len(vocab)] = bytes(special_token, 'utf8')
+    pre_tokens: dict[tuple[bytes, ...], int] = collections.defaultdict(int)
+    merges: list[tuple[bytes, bytes]] = []
+
+    PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+
+    with open(input_path, "rb") as f:
+        num_processes = 4
+        boundaries = find_chunk_boundaries(f, num_processes, special_tokens)
+
+        # The following is a serial implementation, but you can parallelize this
+        # by sending each start/end pair to a set of processes.
+        for start, end in zip(boundaries[:-1], boundaries[1:]):
+            f.seek(start)
+            chunk = f.read(end - start).decode("utf-8", errors="ignore")
+            # Run pre-tokenization on your chunk and store the counts for each pre-token
+            docs = re.split("|".join(re.escape(s) for s in special_tokens), chunk)
+            for c in docs:
+                for match_ in re.finditer(PAT, c):
+                    # WRONG: pre_tokens[tuple(bytes(ch, 'utf8') for ch in match_.group())] += 1
+                    # IMPORTANT: BPE operates on UTF-8 *bytes*, not Unicode code points.
+                    bs = match_.group().encode("utf-8")
+                    pre_tokens[tuple(bytes([b]) for b in bs)] += 1
+
+    while len(vocab) < vocab_size:
+        pairs: dict[tuple[bytes, bytes], int] = collections.defaultdict(int)
+        for token, count in pre_tokens.items():
+            for i in range(len(token)-1):
+                pairs[(token[i], token[i+1])] += count
+        # merge
+        most_common_pair = max(pairs, key=lambda x: (pairs[x], x))
+        merges.append(most_common_pair)
+        vocab[len(vocab)] = most_common_pair[0] + most_common_pair[1]
+
+        new_pre_token: dict[tuple[bytes, ...], int] = {}
+        for token, count in pre_tokens.items():
+            i = 0
+            new_token: list[bytes] = []
+            while i < len(token):
+                if i == len(token) - 1 or (token[i], token[i+1]) != most_common_pair:
+                    new_token.append(bytes(token[i]))
+                    i += 1
+                else:
+                    new_token.append(bytes(token[i]) + bytes(token[i+1]))
+                    i += 2
+            new_pre_token[tuple(new_token)] = count
+        pre_tokens = new_pre_token
+    
+    return vocab, merges
+
+
+def find_chunk_boundaries(
+    file: BinaryIO,
+    desired_num_chunks: int,
+    split_special_tokens: list[str],
+) -> list[int]:
+    """
+    Chunk the file into parts that can be counted independently.
+    May return fewer chunks if the boundaries end up overlapping.
+    """
+    assert isinstance(split_special_tokens, list), "Must represent special token as a list of strings"
+
+    # Get total file size in bytes
+    file.seek(0, os.SEEK_END)
+    file_size = file.tell()
+    file.seek(0)
+
+    chunk_size = file_size // desired_num_chunks
+
+    # Initial guesses for chunk boundary locations, uniformly spaced
+    # Chunks start on previous index, don't include last index
+    chunk_boundaries = [i * chunk_size for i in range(desired_num_chunks + 1)]
+    chunk_boundaries[-1] = file_size
+
+    mini_chunk_size = 4096  # Read ahead by 4k bytes at a time
+
+    for bi in range(1, len(chunk_boundaries) - 1):
+        initial_position = chunk_boundaries[bi]
+        file.seek(initial_position)  # Start at boundary guess
+        while True:
+            mini_chunk = file.read(mini_chunk_size)  # Read a mini chunk
+
+            # If EOF, this boundary should be at the end of the file
+            if mini_chunk == b"":
+                chunk_boundaries[bi] = file_size
+                break
+
+            # Find the special token in the mini chunk
+            for split_special_token in split_special_tokens:
+                found_at = mini_chunk.find(bytes(split_special_token, 'utf8'))
+                if found_at != -1:
+                    chunk_boundaries[bi] = initial_position + found_at
+                    break
+            initial_position += mini_chunk_size
+
+    # Make sure all boundaries are unique, but might be fewer than desired_num_chunks
+    return sorted(set(chunk_boundaries))
+
