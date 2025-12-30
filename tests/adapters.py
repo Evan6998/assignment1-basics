@@ -618,7 +618,8 @@ def run_train_bpe(
                     bs = match_.group().encode("utf-8")
                     pre_tokens[tuple(bytes([b]) for b in bs)] += 1
 
-    while len(vocab) < vocab_size:
+    len_vocab = len(vocab)
+    while len_vocab < vocab_size:
         pairs: dict[tuple[bytes, bytes], int] = collections.defaultdict(int)
         for token, count in pre_tokens.items():
             for i in range(len(token)-1):
@@ -626,14 +627,16 @@ def run_train_bpe(
         # merge
         most_common_pair = max(pairs, key=lambda x: (pairs[x], x))
         merges.append(most_common_pair)
-        vocab[len(vocab)] = most_common_pair[0] + most_common_pair[1]
+        vocab[len_vocab] = most_common_pair[0] + most_common_pair[1]
+        len_vocab += 1
 
         new_pre_token: dict[tuple[bytes, ...], int] = {}
         for token, count in pre_tokens.items():
             i = 0
             new_token: list[bytes] = []
-            while i < len(token):
-                if i == len(token) - 1 or (token[i], token[i+1]) != most_common_pair:
+            len_token = len(token)
+            while i < len_token:
+                if i == len_token - 1 or (token[i], token[i+1]) != most_common_pair:
                     new_token.append(bytes(token[i]))
                     i += 1
                 else:
