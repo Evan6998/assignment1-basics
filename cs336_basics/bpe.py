@@ -1,8 +1,83 @@
-import collections
+import multiprocessing as mp
 import os
 import regex as re
 from collections import Counter
 from typing import BinaryIO
+
+PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+
+def _compile_tokenizers(special_tokens: list[str]):
+    token_re = re.compile(PAT)
+    special_split_re = re.compile("|".join(re.escape(s) for s in special_tokens)) if special_tokens else None
+    return token_re, special_split_re
+
+
+def _build_initial_vocab(special_tokens: list[str]) -> dict[int, bytes]:
+    vocab: dict[int, bytes] = {index: bytes([index]) for index in range(256)}
+    for special_token in special_tokens:
+        vocab[len(vocab)] = bytes(special_token, "utf8")
+    return vocab
+
+
+def _count_chunk(
+    args: tuple[str | os.PathLike[str], int, int, str, str | None],
+) -> Counter[tuple[bytes, ...]]:
+    input_path, start, end, token_pattern, special_pattern = args
+    token_re = re.compile(token_pattern)
+    special_split_re = re.compile(special_pattern) if special_pattern else None
+
+    with open(input_path, "rb") as f:
+        f.seek(start)
+        chunk = f.read(end - start).decode("utf-8", errors="ignore")
+
+    docs = special_split_re.split(chunk) if special_split_re else [chunk]
+    counts: Counter[tuple[bytes, ...]] = Counter()
+    for doc in docs:
+        for match_ in token_re.finditer(doc):
+            # IMPORTANT: BPE operates on UTF-8 *bytes*, not Unicode code points.
+            bs = match_.group().encode("utf-8")
+            counts[tuple(bytes([b]) for b in bs)] += 1
+    print(f"Processed chunk {start}-{end}, found {len(counts)} unique pre-tokens.")
+    return counts
+
+
+def _parallel_count_pre_tokens(
+    input_path: str | os.PathLike[str],
+    boundaries: list[int],
+    token_re: re.Pattern[str],
+    special_split_re: re.Pattern[str] | None,
+    num_processes: int,
+) -> Counter[tuple[bytes, ...]]:
+    if len(boundaries) < 2:
+        return Counter()
+
+    tasks: list[tuple[str | os.PathLike[str], int, int, str, str | None]] = []
+    special_pattern = special_split_re.pattern if special_split_re else None
+    for start, end in zip(boundaries[:-1], boundaries[1:]):
+        tasks.append((input_path, start, end, token_re.pattern, special_pattern))
+
+    if len(tasks) == 1 or num_processes == 1:
+        print("Counting pre-tokens in single process...")
+        return _count_chunk(tasks[0])
+
+    print(f"Counting pre-tokens in parallel with {num_processes} processes...")
+    with mp.Pool(processes=min(num_processes, len(tasks))) as pool:
+        partial_counts = pool.map(_count_chunk, tasks)
+
+    total_counts: Counter[tuple[bytes, ...]] = Counter()
+    for counts in partial_counts:
+        total_counts.update(counts)
+    return total_counts
+
+
+def _build_pair_counts(tokens: dict[tuple[bytes, ...], int]) -> Counter[tuple[bytes, bytes]]:
+    pair_counts: Counter[tuple[bytes, bytes]] = Counter()
+    for token, count in tokens.items():
+        if len(token) < 2:
+            continue
+        for pair in zip(token, token[1:]):
+            pair_counts[pair] += count
+    return pair_counts
 
 
 def train_bpe(
@@ -32,43 +107,24 @@ def train_bpe(
                 Merges are ordered by order of creation.
     """
 
-    vocab: dict[int, bytes] = {index: bytes([index]) for index in range(256)}
-    for special_token in special_tokens:
-        vocab[len(vocab)] = bytes(special_token, "utf8")
-    pre_tokens: dict[tuple[bytes, ...], int] = collections.defaultdict(int)
+    vocab = _build_initial_vocab(special_tokens)
     merges: list[tuple[bytes, bytes]] = []
 
-    PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
-    token_re = re.compile(PAT)
-    special_split_re = re.compile("|".join(re.escape(s) for s in special_tokens)) if special_tokens else None
-
+    token_re, special_split_re = _compile_tokenizers(special_tokens)
+    num_processes = 6
     with open(input_path, "rb") as f:
-        num_processes = 4
         boundaries = find_chunk_boundaries(f, num_processes, special_tokens)
+    print(f"The boundaries for chunking the file are: {boundaries}")
 
-        # The following is a serial implementation, but you can parallelize this
-        # by sending each start/end pair to a set of processes.
-        for start, end in zip(boundaries[:-1], boundaries[1:]):
-            f.seek(start)
-            chunk = f.read(end - start).decode("utf-8", errors="ignore")
-            # Run pre-tokenization on your chunk and store the counts for each pre-token
-            docs = special_split_re.split(chunk) if special_split_re else [chunk]
-            for c in docs:
-                for match_ in token_re.finditer(c):
-                    # IMPORTANT: BPE operates on UTF-8 *bytes*, not Unicode code points.
-                    bs = match_.group().encode("utf-8")
-                    pre_tokens[tuple(bytes([b]) for b in bs)] += 1
+    pre_tokens = _parallel_count_pre_tokens(
+        input_path=input_path,
+        boundaries=boundaries,
+        token_re=token_re,
+        special_split_re=special_split_re,
+        num_processes=num_processes,
+    )
 
-    def build_pair_counts(tokens: dict[tuple[bytes, ...], int]) -> Counter[tuple[bytes, bytes]]:
-        pair_counts: Counter[tuple[bytes, bytes]] = Counter()
-        for token, count in tokens.items():
-            if len(token) < 2:
-                continue
-            for pair in zip(token, token[1:]):
-                pair_counts[pair] += count
-        return pair_counts
-
-    pair_counts = build_pair_counts(pre_tokens)
+    pair_counts = _build_pair_counts(pre_tokens)
     len_vocab = len(vocab)
     while len_vocab < vocab_size:
         most_common_pair = max(pair_counts, key=lambda x: (pair_counts[x], x))
@@ -164,11 +220,14 @@ def find_chunk_boundaries(
                 break
 
             # Find the special token in the mini chunk
-            for split_special_token in split_special_tokens:
-                found_at = mini_chunk.find(bytes(split_special_token, 'utf8'))
-                if found_at != -1:
-                    chunk_boundaries[bi] = initial_position + found_at
-                    break
+            matches = [
+                mini_chunk.find(bytes(split_special_token, 'utf8'))
+                for split_special_token in split_special_tokens
+            ]
+            best = min(i for i in matches)
+            if best != -1:
+                chunk_boundaries[bi] = initial_position + best
+                break
             initial_position += mini_chunk_size
 
     # Make sure all boundaries are unique, but might be fewer than desired_num_chunks
