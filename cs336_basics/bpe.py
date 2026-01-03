@@ -3,13 +3,7 @@ import os
 import regex as re
 from collections import Counter
 from typing import BinaryIO
-
-PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
-
-def _compile_tokenizers(special_tokens: list[str]):
-    token_re = re.compile(PAT)
-    special_split_re = re.compile("|".join(re.escape(s) for s in special_tokens)) if special_tokens else None
-    return token_re, special_split_re
+from cs336_basics.common import compile_tokenizers
 
 
 def _build_initial_vocab(special_tokens: list[str]) -> dict[int, bytes]:
@@ -110,7 +104,7 @@ def train_bpe(
     vocab = _build_initial_vocab(special_tokens)
     merges: list[tuple[bytes, bytes]] = []
 
-    token_re, special_split_re = _compile_tokenizers(special_tokens)
+    token_re, special_split_re = compile_tokenizers(special_tokens)
     num_processes = 6
     with open(input_path, "rb") as f:
         boundaries = find_chunk_boundaries(f, num_processes, special_tokens)
